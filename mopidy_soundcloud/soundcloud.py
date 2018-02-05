@@ -90,31 +90,31 @@ class SoundCloudClient(object):
 
     @cache()
     def get_user_stream(self):
-        # User timeline like playlist which uses undocumented api
-        # https://api.soundcloud.com/e1/me/stream?offset=0
-        # returns five elements per request
+        # https://developers.soundcloud.com/docs/api/reference#activities
         tracks = []
-        for sid in xrange(0, 2):
-            stream = self._get('e1/me/stream?offset=%s' % sid * 5)
-            for data in stream.get('collection'):
-                kind = data.get('type')
+        stream = self._get('me/activities?limit=500').get('collection')
+        if not stream:
+            raise Exception('Could not load your stream!')
+        else:
+            for data in stream:
+                track = data.get('origin')
                 # multiple types of track with same data
-                if 'track' in kind:
-                    tracks.append(self.parse_track(data.get('track')))
-                if kind == 'playlist':
-                    playlist = data.get('playlist').get('tracks')
-                    if isinstance(playlist, collections.Iterable):
-                        tracks.extend(self.parse_results(playlist))
+                if track:
+                    if track['kind'] == 'track':
+                        tracks.append(self.parse_track(track))
+                    if track['kind'] == 'playlist':
+                        playlist = track.get('tracks')
+                        if isinstance(playlist, collections.Iterable):
+                            tracks.extend(self.parse_results(playlist))
 
         return self.sanitize_tracks(tracks)
 
     def get_followings(self, query_user_id=None):
-
         if query_user_id:
             return self._get('users/%s/tracks' % query_user_id)
 
         users = []
-        for playlist in self._get('me/followings.json?limit=60')['collection']:
+        for playlist in self._get('me/followings?limit=500')['collection']:
             name = playlist.get('username')
             user_id = str(playlist.get('id'))
             logger.debug('Fetched user %s with id %s' % (
@@ -124,37 +124,109 @@ class SoundCloudClient(object):
             users.append((name, user_id))
         return users
 
+    def get_history(self):
+        tracks = []
+        for track in self._get('me/play-history/tracks?limit=30&offset=0&linked_partitioning=1', 'api-v2')['collection']:
+            tracks.append(track['track'])
+        return tracks
+
+    def load_from_history(self, track_ids):
+        history = self.get_history();
+
+        tracks = []
+        missing = []
+        for track_id in track_ids:
+            found = False
+            for historical in history:
+                if historical.get('id') == track_id:
+                    tracks.append(self.parse_track(historical))
+                    found = True
+                    break
+            if not found:
+                missing.append(track_id)
+
+        tracks.extend(self.resolve_tracks(missing))
+
+        return self.sanitize_tracks(tracks);
+
+
+    def get_selections(self, selection_id=None, option_id=None):
+        # Return the first list
+        if not selection_id:
+            selections = []
+            selection_id = 0
+            for selection in self._get('selections?limit=30&offset=0&linked_partitioning=1', 'api-v2')['collection']:
+                selections.append((selection.get('title'), str(selection_id)))
+                selection_id += 1
+            return selections
+
+        selection = self._get('selections?limit=50&offset=0&linked_partitioning=1', 'api-v2')['collection'][int(selection_id)]
+        playlistString = "system_playlists" if selection.get('system_playlists') else "playlists"
+
+        # We have the selection_id but not 2nd, return list of playlists.
+        if not option_id:
+            playlists = [];
+            option_id = 0
+            for option in selection.get(playlistString):
+                if option.get('description'):
+                    playlists.append(("%s - %s" % (option.get('title'), option.get('description')), str(option_id)))
+                else:
+                    playlists.append((option.get('title'), str(option_id)))
+                option_id += 1
+            return playlists
+
+        selection = selection.get(playlistString)[int(option_id)]
+
+        if selection['kind'] == "playlist":
+            return self.get_set(selection['id'])
+
+        # We have both options, return the tracks.
+        track_ids = [x.get('id') for x in selection['tracks']]
+
+        #tracks = self.resolve_tracks(track_ids)
+        
+        return self.load_from_history(track_ids);
+
+
     @cache()
     def get_set(self, set_id):
+        # https://developers.soundcloud.com/docs/api/reference#playlists
         playlist = self._get('playlists/%s' % set_id)
         return playlist.get('tracks', [])
 
+    def get_genre(self, genre):
+        # https://developers.soundcloud.com/docs/api/reference#playlists
+        results = []
+        logger.info("Getting genre %s" % genre)
+        for record in self._get('charts?kind=top&genre=soundcloud:genres:%s&limit=50' % genre, 'api-v2')['collection']:
+            results.append(self.parse_track(record['track']))
+        return self.sanitize_tracks(results)
+        
     def get_sets(self):
         playable_sets = []
-        for playlist in self._get('me/playlists?limit=1000'):
+        for record in self._get('users/%s/playlists/liked_and_owned?limit=500' % self._get('me')['id'], 'api-v2')['collection']:
+            playlist = record.get('playlist')
             name = playlist.get('title')
             set_id = str(playlist.get('id'))
-            tracks = playlist.get('tracks')
-            logger.debug('Fetched set %s with id %s (%d tracks)' % (
-                name, set_id, len(tracks)
+            tracks = playlist.get('track_count')
+            logger.info('Fetched set %s with id %s (%s tracks)' % (
+                name, set_id, tracks
             ))
-            playable_sets.append((name, set_id, tracks))
-        return playable_sets
+            playable_sets.append((name, set_id, tracks)) 
+        return self.sanitize_tracks(playable_sets)
 
     def get_user_liked(self):
-        # Note: As with get_user_stream, this API call is undocumented.
+        # https://developers.soundcloud.com/docs/api/reference#GET--users--id--favorites
         likes = []
-        liked = self._get('e1/me/likes?limit=1000')
-        for data in liked:
-
-            track = data['track']
-            if track:
-                likes.append(self.parse_track(track))
-
-            pl = data['playlist']
-            if pl:
-                likes.append((pl['title'], str(pl['id'])))
-
+        liked = self._get('me/favorites?limit=500')
+        if not liked:
+            raise Exception('Could not load your likes!')
+        else:
+            for data in liked:
+                if data['kind'] == 'track':
+                    likes.append(self.parse_track(data))
+                else:
+                    likes.append((data['title'], str(data['id'])))
         return self.sanitize_tracks(likes)
 
     # Public
@@ -174,9 +246,9 @@ class SoundCloudClient(object):
         return track.split('.')[-1]
 
     def search(self, query):
-
+        # https://developers.soundcloud.com/docs/api/reference#tracks
         search_results = self._get(
-            'tracks?q=%s&filter=streamable&order=hotness&limit=%d' % (
+            'tracks?q=%s&limit=%d' % (
                 quote_plus(query.encode('utf-8')), self.explore_songs))
         tracks = []
         for track in search_results:
@@ -214,7 +286,7 @@ class SoundCloudClient(object):
             return None
         if not data['streamable']:
             logger.info(
-                "'%s' can't be streamed from SoundCloud" % data.get('title'))
+                "'%s' can't be streamed from SoundCloud - data'streamable doesn't exist" % data.get('title'))
             return None
         if not data['kind'] == 'track':
             logger.debug('%s is not track' % data.get('title'))
@@ -245,9 +317,7 @@ class SoundCloudClient(object):
 
         if remote_url:
             if not self.can_be_streamed(data['stream_url']):
-                logger.info(
-                    "'%s' can't be streamed from SoundCloud" % data.get(
-                        'title'))
+                logger.info("'%s' can't be streamed from SoundCloud canbestreamed return false" % data.get('title'))
                 return None
             track_kwargs[b'uri'] = self.get_streamble_url(data['stream_url'])
         else:
@@ -264,9 +334,9 @@ class SoundCloudClient(object):
 
         if album_kwargs:
             if 'artwork_url' in data and data['artwork_url']:
-                album_kwargs[b'images'] = [data['artwork_url']]
+                album_kwargs[b'images'] = [data['artwork_url'].replace("large","t500x500")]
             else:
-                image = data.get('user').get('avatar_url')
+                image = data.get('user').get('avatar_url').replace("large","t500x500") 
                 album_kwargs[b'images'] = [image]
 
             album = Album(**album_kwargs)
@@ -278,8 +348,9 @@ class SoundCloudClient(object):
     @cache()
     def can_be_streamed(self, url):
         req = self.http_client.head(self.get_streamble_url(url))
+        logger.info(self.get_streamble_url(url))
         return req.status_code == 302
-
+ 
     def get_streamble_url(self, url):
         return '%s?client_id=%s' % (url, self.CLIENT_ID)
 
