@@ -9,11 +9,11 @@ from urlparse import urlparse
 from mopidy import backend, models
 from mopidy.models import SearchResult, Track
 
-from mopidy_soundcloud.soundcloud import safe_url
+from mopidy_soundcloud.soundcloud import safe_url, readable_url
 
 
 logger = logging.getLogger(__name__)
-
+genres = [('All','all-music'), ('House','house'), ('Deep House', 'deephouse'), ('Electronic Dance Music', 'danceedm'), ('Drum & Bass', 'drumbass'), ('Techno', 'techno'), ('Trance', 'trance'), ('Ambient', 'ambient'), ('Disco', 'disco'), ('Electronic', 'electronic'), ('Pop', 'pop'), ('Dubstep', 'dubstep')]
 
 def generate_uri(path):
     return 'soundcloud:directory:%s' % urllib.quote('/'.join(path))
@@ -22,7 +22,7 @@ def generate_uri(path):
 def new_folder(name, path):
     return models.Ref.directory(
         uri=generate_uri(path),
-        name=safe_url(name)
+        name=readable_url(name)
     )
 
 
@@ -54,6 +54,8 @@ class SoundCloudLibraryProvider(backend.LibraryProvider):
         self.add_to_vfs(new_folder('Following', ['following']))
         self.add_to_vfs(new_folder('Liked', ['liked']))
         self.add_to_vfs(new_folder('Sets', ['sets']))
+        self.add_to_vfs(new_folder('Genres', ['genres']))
+        self.add_to_vfs(new_folder('Selections', ['selections']))
         self.add_to_vfs(new_folder('Stream', ['stream']))
 
     def add_to_vfs(self, _model):
@@ -65,6 +67,24 @@ class SoundCloudLibraryProvider(backend.LibraryProvider):
             sets_list = new_folder(name, ['sets', set_id])
             logger.debug('Adding set %s to vfs' % sets_list.name)
             sets_vfs[set_id] = sets_list
+        return sets_vfs.values()
+
+    def list_genres(self):
+        sets_vfs = collections.OrderedDict()
+        for (name, genre) in genres:
+            sets_list = new_folder(name, ['genres', genre])
+            sets_vfs[genre] = sets_list
+        return sets_vfs.values()
+
+    def list_selections(self, id=None):
+        sets_vfs = collections.OrderedDict()
+        for (name, selection_id) in self.backend.remote.get_selections(id):
+            if id:
+                sets_list = new_folder(name, ['selections', str(id), str(selection_id)])
+            else:
+                sets_list = new_folder(name, ['selections', str(selection_id)])
+            #logger.debug('Adding personalized set %s to vfs' % sets_list.name)
+            sets_vfs[selection_id] = sets_list
         return sets_vfs.values()
 
     def list_liked(self):
@@ -104,7 +124,8 @@ class SoundCloudLibraryProvider(backend.LibraryProvider):
 
     def browse(self, uri):
         if not self.vfs.get(uri):
-            (req_type, res_id) = re.match(r'.*:(\w*)(?:/(\d*))?', uri).groups()
+            (req_type, res_id) = re.match(r'.*:(\w*)(?:/(.*))?', uri).groups()
+            logger.info("Request Type %s, Request ID: %s, URI: %s", req_type, res_id, uri)
             # Sets
             if 'sets' == req_type:
                 if res_id:
@@ -121,6 +142,26 @@ class SoundCloudLibraryProvider(backend.LibraryProvider):
                     )
                 else:
                     return self.list_user_follows()
+            if 'genres' == req_type:
+                if res_id:
+                    return self.tracklist_to_vfs(
+                        self.backend.remote.get_genre(res_id)
+                    )
+                else:
+                    return self.list_genres()
+
+            if 'selections' == req_type:
+                if res_id:
+                    data = res_id.split('/');
+                    if len(data) > 1:
+                        return self.tracklist_to_vfs(
+                            self.backend.remote.get_selections(data[0], data[1])
+                        )
+                    elif len(data) > 0:
+                        return self.list_selections(data[0])
+                        
+                return self.list_selections()
+
             # Liked
             if 'liked' == req_type:
                 return self.list_liked()
